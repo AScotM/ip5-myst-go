@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -46,9 +48,43 @@ type Glyph struct {
 	Color     int
 }
 
+type TrafficSample struct {
+	At        time.Time `json:"at"`
+	RX        float64   `json:"rx"`
+	TX        float64   `json:"tx"`
+	RXPackets float64   `json:"rx_packets"`
+	TXPackets float64   `json:"tx_packets"`
+}
+
+type NetworkCounters struct {
+	RXBytes   uint64
+	RXPackets uint64
+	RXErrors  uint64
+	RXDrops   uint64
+	TXBytes   uint64
+	TXPackets uint64
+	TXErrors  uint64
+	TXDrops   uint64
+}
+
 type NetworkEntity struct {
 	Name          string
 	Interface     string
+	RXPackets     uint64
+	TXPackets     uint64
+	RXErrors      uint64
+	TXErrors      uint64
+	RXDrops       uint64
+	TXDrops       uint64
+	RXPacketRate  float64
+	TXPacketRate  float64
+	PeakRX        float64
+	PeakTX        float64
+	AverageRX     float64
+	AverageTX     float64
+	History       []TrafficSample
+	Alert         string
+	LastAlert     time.Time
 	RXBytes       uint64
 	TXBytes       uint64
 	RXRate        float64
@@ -174,6 +210,89 @@ func (e *NetworkEntity) updateCounters(rx, tx uint64, sampleTime time.Time) {
 	e.LastSeen = sampleTime
 }
 
+func (e *NetworkEntity) updateStatistics(c NetworkCounters, now time.Time, maxHistory int) {
+	elapsed := now.Sub(e.LastSample).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	previousRX, previousTX := e.RXBytes, e.TXBytes
+	previousRXPackets, previousTXPackets := e.RXPackets, e.TXPackets
+	previousRXErrors, previousTXErrors := e.RXErrors, e.TXErrors
+	previousRXDrops, previousTXDrops := e.RXDrops, e.TXDrops
+	reset := c.RXBytes < previousRX || c.TXBytes < previousTX || c.RXPackets < previousRXPackets || c.TXPackets < previousTXPackets
+	if reset {
+		e.RXRate, e.TXRate, e.RXPacketRate, e.TXPacketRate = 0, 0, 0, 0
+		e.Alert = "Counters reset"
+	} else {
+		e.RXRate = float64(c.RXBytes-previousRX) / elapsed
+		e.TXRate = float64(c.TXBytes-previousTX) / elapsed
+		e.RXPacketRate = float64(c.RXPackets-previousRXPackets) / elapsed
+		e.TXPacketRate = float64(c.TXPackets-previousTXPackets) / elapsed
+	}
+	e.RXBytes, e.TXBytes = c.RXBytes, c.TXBytes
+	e.RXPackets, e.TXPackets = c.RXPackets, c.TXPackets
+	e.RXErrors, e.TXErrors = c.RXErrors, c.TXErrors
+	e.RXDrops, e.TXDrops = c.RXDrops, c.TXDrops
+	e.LastSample, e.LastSeen = now, now
+	e.PeakRX = math.Max(e.PeakRX, e.RXRate)
+	e.PeakTX = math.Max(e.PeakTX, e.TXRate)
+	if maxHistory < 2 {
+		maxHistory = 2
+	}
+	e.History = append(e.History, TrafficSample{At: now, RX: e.RXRate, TX: e.TXRate, RXPackets: e.RXPacketRate, TXPackets: e.TXPacketRate})
+	if len(e.History) > maxHistory {
+		e.History = append([]TrafficSample(nil), e.History[len(e.History)-maxHistory:]...)
+	}
+	var rxSum, txSum float64
+	for _, sample := range e.History {
+		rxSum += sample.RX
+		txSum += sample.TX
+	}
+	e.AverageRX = rxSum / float64(len(e.History))
+	e.AverageTX = txSum / float64(len(e.History))
+	if c.RXErrors > previousRXErrors || c.TXErrors > previousTXErrors || c.RXDrops > previousRXDrops || c.TXDrops > previousTXDrops {
+		e.Alert = "Packet errors or drops increased"
+	} else if len(e.History) >= 5 && (e.RXRate+e.TXRate) > math.Max(100_000, 3*(e.AverageRX+e.AverageTX)) {
+		e.Alert = "Unusual traffic surge"
+	} else if !reset {
+		e.Alert = ""
+	}
+	if e.Alert != "" && now.Sub(e.LastAlert) > 15*time.Second {
+		e.addWhisper(e.Alert)
+		e.LastAlert = now
+	}
+}
+
+func (e *NetworkEntity) sparkline(width int) string {
+	if width <= 0 || len(e.History) == 0 {
+		return ""
+	}
+	bars := []rune("▁▂▃▄▅▆▇█")
+	samples := e.History
+	if len(samples) > width {
+		samples = samples[len(samples)-width:]
+	}
+	peak := 0.0
+	for _, sample := range samples {
+		peak = math.Max(peak, sample.RX+sample.TX)
+	}
+	var out strings.Builder
+	for _, sample := range samples {
+		level := 0
+		if peak > 0 {
+			level = int(math.Round((sample.RX + sample.TX) / peak * float64(len(bars)-1)))
+		}
+		if level < 0 {
+			level = 0
+		}
+		if level >= len(bars) {
+			level = len(bars) - 1
+		}
+		out.WriteRune(bars[level])
+	}
+	return out.String()
+}
+
 func (e *NetworkEntity) updateGlyphs(density float64) {
 	if len(e.Glyphs) > 20 {
 		e.Glyphs = e.Glyphs[len(e.Glyphs)-20:]
@@ -266,6 +385,8 @@ type MysticConfig struct {
 	MaxSpirits     int     `json:"max_spirits"`
 	ShowLoopback   bool    `json:"show_loopback"`
 	IPCacheTTL     float64 `json:"ip_cache_ttl"`
+	HistorySize    int     `json:"history_size"`
+	AlertThreshold float64 `json:"alert_threshold"`
 }
 
 func defaultConfig() MysticConfig {
@@ -280,6 +401,8 @@ func defaultConfig() MysticConfig {
 		MaxSpirits:     20,
 		ShowLoopback:   false,
 		IPCacheTTL:     10.0,
+		HistorySize:    120,
+		AlertThreshold: 3.0,
 	}
 }
 
@@ -330,6 +453,12 @@ func (c *MysticConfig) loadFromFile(path string) {
 		c.ShowLoopback = value
 	}
 
+	if value, ok := numberValue(raw["history_size"]); ok && value >= 2 && value <= 10000 {
+		c.HistorySize = int(value)
+	}
+	if value, ok := numberValue(raw["alert_threshold"]); ok && value >= 1 {
+		c.AlertThreshold = value
+	}
 	if value, ok := numberValue(raw["ip_cache_ttl"]); ok && value > 0 {
 		c.IPCacheTTL = value
 	}
@@ -718,6 +847,9 @@ func (s *Screen) put(y, x int, text string, color, attr int) {
 	position := x
 
 	for _, r := range text {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
 		if position < 0 {
 			position++
 			continue
@@ -788,6 +920,9 @@ type NetworkMystic struct {
 	lastRitual  time.Time
 	input       chan byte
 	inputErrors chan error
+	scroll      int
+	sortMode    int
+	paused      bool
 }
 
 func newNetworkMystic(config MysticConfig) *NetworkMystic {
@@ -904,6 +1039,22 @@ func (m *NetworkMystic) performRituals(force bool) {
 	m.lastRitual = now
 }
 
+func parseCounters(fields []string) (NetworkCounters, error) {
+	if len(fields) < 16 {
+		return NetworkCounters{}, errors.New("incomplete counters")
+	}
+	indexes := []int{0, 1, 2, 3, 8, 9, 10, 11}
+	values := make([]uint64, len(indexes))
+	for i, index := range indexes {
+		n, err := strconv.ParseUint(fields[index], 10, 64)
+		if err != nil {
+			return NetworkCounters{}, err
+		}
+		values[i] = n
+	}
+	return NetworkCounters{values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]}, nil
+}
+
 func (m *NetworkMystic) scanSpirits() {
 	file, err := os.Open("/proc/net/dev")
 	if err != nil {
@@ -953,15 +1104,11 @@ func (m *NetworkMystic) scanSpirits() {
 			continue
 		}
 
-		rx, err := strconv.ParseUint(fields[0], 10, 64)
+		counters, err := parseCounters(fields)
 		if err != nil {
 			continue
 		}
-
-		tx, err := strconv.ParseUint(fields[8], 10, 64)
-		if err != nil {
-			continue
-		}
+		rx, tx := counters.RXBytes, counters.TXBytes
 
 		found[interfaceName] = true
 
@@ -975,6 +1122,9 @@ func (m *NetworkMystic) scanSpirits() {
 				currentTime,
 			)
 
+			entity.RXPackets, entity.TXPackets = counters.RXPackets, counters.TXPackets
+			entity.RXErrors, entity.TXErrors = counters.RXErrors, counters.TXErrors
+			entity.RXDrops, entity.TXDrops = counters.RXDrops, counters.TXDrops
 			m.Entities[interfaceName] = entity
 
 			m.Whispers.add(
@@ -986,11 +1136,7 @@ func (m *NetworkMystic) scanSpirits() {
 				"SPIRIT",
 			)
 		} else {
-			entity.updateCounters(
-				rx,
-				tx,
-				currentTime,
-			)
+			entity.updateStatistics(counters, currentTime, m.Config.HistorySize)
 		}
 
 		m.refreshEntityIPs(
@@ -1033,16 +1179,24 @@ func (m *NetworkMystic) scanSpirits() {
 func (m *NetworkMystic) updateEntityWhispers(entity *NetworkEntity) {
 	switch {
 	case entity.RXRate > 1_000_000:
-		entity.addWhisper("Great flow from beyond")
+		if len(entity.Whispers) == 0 || !strings.Contains(entity.Whispers[len(entity.Whispers)-1], "Great flow from beyond") {
+			entity.addWhisper("Great flow from beyond")
+		}
 
 	case entity.RXRate < 1_000 && entity.TXRate < 1_000:
-		entity.addWhisper("Resting in silence")
+		if len(entity.Whispers) == 0 || !strings.Contains(entity.Whispers[len(entity.Whispers)-1], "Resting in silence") {
+			entity.addWhisper("Resting in silence")
+		}
 
 	case entity.RXRate > entity.TXRate*2:
-		entity.addWhisper("Listening more than speaking")
+		if len(entity.Whispers) == 0 || !strings.Contains(entity.Whispers[len(entity.Whispers)-1], "Listening more than speaking") {
+			entity.addWhisper("Listening more than speaking")
+		}
 
 	case entity.TXRate > entity.RXRate*2:
-		entity.addWhisper("Whispering to the void")
+		if len(entity.Whispers) == 0 || !strings.Contains(entity.Whispers[len(entity.Whispers)-1], "Whispering to the void") {
+			entity.addWhisper("Whispering to the void")
+		}
 	}
 }
 
@@ -1057,66 +1211,29 @@ func (m *NetworkMystic) refreshEntityIPs(entity *NetworkEntity, now time.Time) {
 }
 
 func getInterfaceIPs(interfaceName string) []string {
-	command := exec.Command(
-		"ip",
-		"-o",
-		"-4",
-		"addr",
-		"show",
-		"dev",
-		interfaceName,
-	)
-
-	type result struct {
-		output []byte
-		err    error
-	}
-
-	done := make(chan result, 1)
-
-	go func() {
-		output, err := command.Output()
-
-		done <- result{
-			output: output,
-			err:    err,
-		}
-	}()
-
-	var output []byte
-
-	select {
-	case result := <-done:
-		if result.err != nil {
-			return nil
-		}
-
-		output = result.output
-
-	case <-time.After(2 * time.Second):
-		if command.Process != nil {
-			_ = command.Process.Kill()
-		}
-
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
 		return nil
 	}
-
-	var ips []string
-
-	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-
-		if len(fields) < 4 {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	ips := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() {
 			continue
 		}
-
-		ip := strings.SplitN(fields[3], "/", 2)[0]
-
-		if ip != "" && ip != "127.0.0.1" {
-			ips = append(ips, ip)
-		}
+		ips = append(ips, ip.String())
 	}
-
+	sort.Strings(ips)
 	return ips
 }
 
@@ -1364,7 +1481,16 @@ func (m *NetworkMystic) drawSpiritInfo(
 	)
 
 	line++
-
+	m.Screen.put(yStart+line, 2, fmt.Sprintf("│  Packets: RX %.1f/s  TX %.1f/s", entity.RXPacketRate, entity.TXPacketRate), 0, attrDim)
+	line++
+	m.Screen.put(yStart+line, 2, fmt.Sprintf("│  Errors: RX %d TX %d  Drops: RX %d TX %d", entity.RXErrors, entity.TXErrors, entity.RXDrops, entity.TXDrops), 0, attrDim)
+	line++
+	m.Screen.put(yStart+line, 2, "│  Flow history: "+entity.sparkline(maxInt(0, minInt(width-24, 38))), 2, attrNormal)
+	line++
+	if entity.Alert != "" {
+		m.Screen.put(yStart+line, 2, "│  Warning: "+entity.Alert, 6, attrBold)
+		line++
+	}
 	if width >= 48 {
 		m.renderFlowVisualization(
 			entity.RXRate,
@@ -1614,15 +1740,23 @@ func (m *NetworkMystic) drawVeil() {
 		spirits = append(spirits, entity)
 	}
 
-	sort.Slice(
-		spirits,
-		func(i, j int) bool {
+	sort.Slice(spirits, func(i, j int) bool {
+		switch m.sortMode {
+		case 1:
+			return spirits[i].Interface < spirits[j].Interface
+		case 2:
+			return spirits[i].RXRate > spirits[j].RXRate
+		case 3:
+			return spirits[i].TXRate > spirits[j].TXRate
+		default:
 			left := spirits[i].RXRate + spirits[i].TXRate
 			right := spirits[j].RXRate + spirits[j].TXRate
-
+			if left == right {
+				return spirits[i].Interface < spirits[j].Interface
+			}
 			return left > right
-		},
-	)
+		}
+	})
 
 	y := 2
 	reservedBottom := 4
@@ -1633,11 +1767,19 @@ func (m *NetworkMystic) drawVeil() {
 		limit = m.Config.MaxSpirits
 	}
 
-	for _, spirit := range spirits[:limit] {
-		blockHeight := 8
-
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+	if m.scroll >= limit {
+		m.scroll = maxInt(0, limit-1)
+	}
+	for _, spirit := range spirits[m.scroll:limit] {
+		blockHeight := 12
 		if m.Config.ShowAura {
-			blockHeight = 9
+			blockHeight = 13
+		}
+		if spirit.Alert != "" {
+			blockHeight++
 		}
 
 		if y+blockHeight >= height-reservedBottom {
@@ -1746,6 +1888,20 @@ func (m *NetworkMystic) handleKey(key byte) {
 
 		m.drawVeil()
 
+	case 'j', 'J':
+		m.scroll++
+		m.drawVeil()
+	case 'k', 'K':
+		if m.scroll > 0 {
+			m.scroll--
+		}
+		m.drawVeil()
+	case 's', 'S':
+		m.sortMode = (m.sortMode + 1) % 4
+		m.drawVeil()
+	case 'p', 'P':
+		m.paused = !m.paused
+		m.drawVeil()
 	case 'w', 'W':
 		m.Config.ShowWhispers = !m.Config.ShowWhispers
 
@@ -1806,6 +1962,9 @@ func (m *NetworkMystic) runRitual() error {
 			}
 
 		case <-ticker.C:
+			if m.paused {
+				continue
+			}
 			now := time.Now()
 
 			if m.lastScan.IsZero() ||
@@ -1821,17 +1980,31 @@ func (m *NetworkMystic) runRitual() error {
 }
 
 type MysteryEntity struct {
-	Spirit    string   `json:"spirit"`
-	Interface string   `json:"interface"`
-	Essence   float64  `json:"essence"`
-	Aura      string   `json:"aura"`
-	TotalRX   uint64   `json:"total_rx"`
-	TotalTX   uint64   `json:"total_tx"`
-	RXRate    float64  `json:"rx_rate"`
-	TXRate    float64  `json:"tx_rate"`
-	IPs       []string `json:"ips"`
-	Whispers  []string `json:"whispers"`
-	Timestamp string   `json:"timestamp"`
+	Spirit       string          `json:"spirit"`
+	Interface    string          `json:"interface"`
+	Essence      float64         `json:"essence"`
+	Aura         string          `json:"aura"`
+	TotalRX      uint64          `json:"total_rx"`
+	TotalTX      uint64          `json:"total_tx"`
+	RXRate       float64         `json:"rx_rate"`
+	RXPackets    uint64          `json:"rx_packets"`
+	TXPackets    uint64          `json:"tx_packets"`
+	RXErrors     uint64          `json:"rx_errors"`
+	TXErrors     uint64          `json:"tx_errors"`
+	RXDrops      uint64          `json:"rx_drops"`
+	TXDrops      uint64          `json:"tx_drops"`
+	RXPacketRate float64         `json:"rx_packet_rate"`
+	TXPacketRate float64         `json:"tx_packet_rate"`
+	PeakRX       float64         `json:"peak_rx"`
+	PeakTX       float64         `json:"peak_tx"`
+	AverageRX    float64         `json:"average_rx"`
+	AverageTX    float64         `json:"average_tx"`
+	Alert        string          `json:"alert,omitempty"`
+	History      []TrafficSample `json:"history,omitempty"`
+	TXRate       float64         `json:"tx_rate"`
+	IPs          []string        `json:"ips"`
+	Whispers     []string        `json:"whispers"`
+	Timestamp    string          `json:"timestamp"`
 }
 
 type MysteryLog struct {
@@ -1878,6 +2051,14 @@ func (m *NetworkMystic) saveMysteries() {
 				TotalRX:   entity.RXBytes,
 				TotalTX:   entity.TXBytes,
 				RXRate:    entity.RXRate,
+				RXPackets: entity.RXPackets, TXPackets: entity.TXPackets,
+				RXErrors: entity.RXErrors, TXErrors: entity.TXErrors,
+				RXDrops: entity.RXDrops, TXDrops: entity.TXDrops,
+				RXPacketRate: entity.RXPacketRate, TXPacketRate: entity.TXPacketRate,
+				PeakRX: entity.PeakRX, PeakTX: entity.PeakTX,
+				AverageRX: entity.AverageRX, AverageTX: entity.AverageTX,
+				Alert:     entity.Alert,
+				History:   append([]TrafficSample(nil), entity.History...),
 				TXRate:    entity.TXRate,
 				IPs:       ips,
 				Whispers:  whispers,
@@ -1913,7 +2094,7 @@ func (m *NetworkMystic) saveMysteries() {
 	file, err := os.OpenFile(
 		m.Config.LogFile,
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
-		0o644,
+		0o600,
 	)
 
 	if err != nil {
@@ -2008,7 +2189,7 @@ func (m *NetworkMystic) cleanup() {
 
 	fmt.Fprintln(
 		os.Stderr,
-		"  w - Toggle whispers",
+		"  w - Toggle whispers; j/k - Scroll; s - Sort; p - Pause",
 	)
 }
 
@@ -2057,9 +2238,40 @@ func truncateRunes(value string, maximum int) string {
 
 func main() {
 	config := defaultConfig()
-
-	if len(os.Args) > 1 {
-		config.loadFromFile(os.Args[1])
+	configPath := flag.String("config", "", "JSON configuration file")
+	interval := flag.Float64("interval", 0, "Polling interval in seconds")
+	history := flag.Int("history", 0, "Samples retained per interface")
+	loopback := flag.Bool("loopback", false, "Include loopback interface")
+	logFile := flag.String("log", "", "JSONL output path")
+	flag.Parse()
+	if *configPath != "" {
+		config.loadFromFile(*configPath)
+	} else if flag.NArg() > 0 {
+		config.loadFromFile(flag.Arg(0))
+	}
+	if *interval > 0 {
+		config.UpdateInterval = *interval
+	}
+	if *history >= 2 {
+		config.HistorySize = *history
+	}
+	if *loopback {
+		config.ShowLoopback = true
+	}
+	if *logFile != "" {
+		config.LogFile = *logFile
+	}
+	if config.UpdateInterval < 0.1 {
+		config.UpdateInterval = 0.1
+	}
+	if config.HistorySize < 2 {
+		config.HistorySize = 2
+	}
+	if config.HistorySize > 10000 {
+		config.HistorySize = 10000
+	}
+	if config.MaxSpirits < 1 {
+		config.MaxSpirits = 1
 	}
 
 	mystic := newNetworkMystic(config)
